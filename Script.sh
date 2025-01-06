@@ -1,6 +1,5 @@
 #!/bin/bash
 # Script to delete old Helm charts and verify new ones
-# Usage: ./helm-cleanup.sh <namespace>
 
 set -e
 NAMESPACE=$1
