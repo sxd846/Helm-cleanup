@@ -1,1 +1,114 @@
+#!/bin/bash
 
+# Script to find and delete resources with nginx-custom-chart label/annotation
+
+set -e
+
+NAMESPACE=$1
+CHART_NAME="nginx-custom-chart"
+BACKUP_DIR="./k8s-backup-${NAMESPACE}"
+
+if [ -z "$NAMESPACE" ]; then
+    echo "Usage: ./cleanup-nginx-resources.sh <namespace>"
+    echo "Example: ./cleanup-nginx-resources.sh my-namespace"
+    exit 1
+fi
+
+# Check if namespace exists
+if ! kubectl get namespace "$NAMESPACE" &> /dev/null; then
+    echo "❌ Namespace $NAMESPACE does not exist"
+    exit 1
+fi
+
+# Function to backup resources before deletion
+backup_resources() {
+    local resource_type=$1
+    local resource_name=$2
+    
+    mkdir -p "$BACKUP_DIR"
+    kubectl get "$resource_type" "$resource_name" -n "$NAMESPACE" -o yaml > "$BACKUP_DIR/${resource_type}-${resource_name}-$(date +%Y%m%d-%H%M%S).yaml"
+}
+
+# Function to check labels and annotations for chart name
+check_resource() {
+    local resource_type=$1
+    local resource_name=$2
+    
+    # Check labels
+    local labels=$(kubectl get "$resource_type" "$resource_name" -n "$NAMESPACE" -o jsonpath='{.metadata.labels}' 2>/dev/null)
+    if echo "$labels" | grep -q "$CHART_NAME"; then
+        echo "Found $CHART_NAME in labels of $resource_type/$resource_name"
+        return 0
+    fi
+    
+    # Check annotations
+    local annotations=$(kubectl get "$resource_type" "$resource_name" -n "$NAMESPACE" -o jsonpath='{.metadata.annotations}' 2>/dev/null)
+    if echo "$annotations" | grep -q "$CHART_NAME"; then
+        echo "Found $CHART_NAME in annotations of $resource_type/$resource_name"
+        return 0
+    fi
+    
+    return 1
+}
+
+# List of resource types to check
+RESOURCE_TYPES="deployments services configmaps secrets ingresses statefulsets daemonsets jobs cronjobs pods replicasets"
+
+echo "🔍 Scanning resources in namespace: $NAMESPACE"
+echo "Looking for resources with chart name: $CHART_NAME"
+
+# Arrays to store resources to be deleted
+declare -a resources_to_delete
+
+# Scan all resource types
+for resource_type in $RESOURCE_TYPES; do
+    echo "Checking $resource_type..."
+    
+    # Get all resources of this type in the namespace
+    resources=$(kubectl get "$resource_type" -n "$NAMESPACE" -o name 2>/dev/null) || continue
+    
+    for resource in $resources; do
+        resource_name=$(echo "$resource" | cut -d'/' -f2)
+        
+        if check_resource "$resource_type" "$resource_name"; then
+            resources_to_delete+=("$resource_type/$resource_name")
+        fi
+    done
+done
+
+# If no resources found
+if [ ${#resources_to_delete[@]} -eq 0 ]; then
+    echo "No resources found with chart name: $CHART_NAME"
+    exit 0
+fi
+
+# Display resources to be deleted
+echo -e "\n🗑️  The following resources will be deleted:"
+printf '%s\n' "${resources_to_delete[@]}"
+
+# Ask for confirmation
+read -p "Are you sure you want to delete these resources? (y/N) " -n 1 -r
+echo
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo "Operation cancelled"
+    exit 1
+fi
+
+# Delete resources
+echo -e "\n📦 Creating backups and deleting resources..."
+for resource in "${resources_to_delete[@]}"; do
+    IFS='/' read -r resource_type resource_name <<< "$resource"
+    
+    echo "Processing $resource_type/$resource_name..."
+    
+    # Backup resource
+    backup_resources "$resource_type" "$resource_name"
+    
+    # Delete resource
+    kubectl delete "$resource_type" "$resource_name" -n "$NAMESPACE"
+    echo "✅ Deleted $resource_type/$resource_name"
+done
+
+echo -e "\n✅ Cleanup completed!"
+echo "Backups are stored in: $BACKUP_DIR"
+echo "To restore any resource, use: kubectl apply -f $BACKUP_DIR/<backup-file>.yaml"
